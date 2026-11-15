@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const adminController = require('../controllers/adminController');
-// limit failed admin logins (see middleware/rateLimit.js) try
+// limit failed admin logins (see middleware/rateLimit.js)
 const { loginLimiter } = require('../middleware/rateLimit');
 // records every change made through the admin panel
 const { auditAdminActions } = require('../middleware/auditLog');
@@ -39,8 +39,12 @@ router.post('/landlord-requests/:id/reject', adminController.rejectLandlord);
 router.get('/listings', adminController.getAllListingsAdmin);
 router.post('/listings/:id/hide', adminController.hideListing);
 router.post('/listings/:id/unhide', adminController.unhideListing);
-// NEW: decline a landlord's appeal (the listing stays hidden)
+// decline a landlord's appeal (the listing stays hidden)
 router.post('/listings/:id/dismiss-appeal', adminController.dismissAppeal);
+
+// NEW: user reports about listings
+router.get('/reports', adminController.getReportsAdmin);
+router.post('/listings/:id/dismiss-reports', adminController.dismissReports);
 
 // Reviews (moderation)
 router.get('/reviews', adminController.getAllReviewsAdmin);
