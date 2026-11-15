@@ -9,7 +9,7 @@ const { auditAdminActions } = require('../middleware/auditLog');
 // Public - this is what ISSUES the signed admin token
 router.post('/login', loginLimiter, adminController.adminLogin);
 
-// Everything below this line requires a valid admin token (x-admin-key header)
+// Everything below this line requires a valid admin token (x-admin-key header) dayum
 router.use(adminController.verifyAdminKey);
 
 // audit trail (must come AFTER the token check so req.adminId exists)
