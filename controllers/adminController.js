@@ -4,6 +4,8 @@ const { signAdminToken, requireAdmin, markSuspended, markActive } = require('../
 // Same in-memory /api/view cache used by userController.js - anything an admin
 // does that changes what the public sees must clear it.
 const listingsCache = require('../utils/listingsCache');
+// NEW: notification helpers (defined in userController.js)
+const { notifyUser, notifyListingOwner } = require('./userController');
 
 const BCRYPT_ROUNDS = 10;
 const isBcryptHash = (str) => typeof str === 'string' && /^\$2[aby]\$\d{2}\$/.test(str);
@@ -117,7 +119,12 @@ exports.getStats = (req, res) => {
     `;
     db.query(sql, (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
-        res.json(rows[0]);
+        const stats = rows[0];
+        // Kept as a separate query so the dashboard still loads if the reports table is missing.
+        db.query(`SELECT COUNT(DISTINCT listing_id) AS n FROM listing_reports WHERE status = 'open'`, (rErr, rRows) => {
+            stats.openReports = rErr ? 0 : rRows[0].n;
+            res.json(stats);
+        });
     });
 };
 
@@ -222,6 +229,7 @@ exports.unsuspendUser = withLabel('user', (req, res) => {
         if (result.affectedRows === 0) return res.status(404).json({ message: 'User not found' });
         markActive(id);
         listingsCache.clear();
+        notifyUser(id, 'account_reinstated', 'Your account is active again', 'An admin lifted your suspension. Welcome back!');
         res.json({ success: true, message: 'User unsuspended' });
     });
 });
@@ -262,6 +270,7 @@ exports.approveLandlord = withLabel('user', (req, res) => {
         if (err) return res.status(500).json({ error: err.message });
         if (result.affectedRows === 0) return res.status(404).json({ message: 'User not found' });
         listingsCache.clear(); // landlord_status (Verified badge) is shown on cached listings
+        notifyUser(id, 'landlord_approved', 'Landlord request approved', 'You can now post listings from your account.');
         res.json({ success: true, message: 'Landlord request approved' });
     });
 });
@@ -277,6 +286,7 @@ exports.rejectLandlord = withLabel('user', (req, res) => {
         if (err) return res.status(500).json({ error: err.message });
         if (result.affectedRows === 0) return res.status(404).json({ message: 'User not found' });
         listingsCache.clear();
+        notifyUser(id, 'landlord_rejected', 'Landlord request rejected', finalReason);
         res.json({ success: true, message: 'Landlord request rejected' });
     });
 });
@@ -308,6 +318,22 @@ exports.getAllListingsAdmin = (req, res) => {
     });
 };
 
+// Closes every OPEN report of a listing as 'resolved' or 'dismissed' and tells
+// each reporter. done(err, closedCount)
+function closeReports(listingId, status, message, done) {
+    const sqlNotify = `INSERT INTO notifications (user_id, type, title, message)
+                       SELECT reporter_id, 'report_update', 'Update on your report', ?
+                       FROM listing_reports WHERE listing_id = ? AND status = 'open'`;
+    db.query(sqlNotify, [message.slice(0, 500), listingId], (nErr) => {
+        if (nErr) console.error('Report notifications failed:', nErr.message);
+        db.query(
+            `UPDATE listing_reports SET status = ?, resolved_at = NOW() WHERE listing_id = ? AND status = 'open'`,
+            [status, listingId],
+            (err, result) => { if (done) done(err, result ? result.affectedRows : 0); }
+        );
+    });
+}
+
 // POST /api/admin/listings/:id/hide   { reason }
 exports.hideListing = withLabel('listing', (req, res) => {
     const { id } = req.params;
@@ -322,6 +348,8 @@ exports.hideListing = withLabel('listing', (req, res) => {
         if (err) return res.status(500).json({ error: err.message });
         if (result.affectedRows === 0) return res.status(404).json({ message: 'Listing not found' });
         listingsCache.clear();
+        notifyListingOwner(id, 'listing_hidden', 'Your listing was hidden', (t) => `"${t}" was hidden by an admin. Reason: ${reason}`);
+        closeReports(id, 'resolved', 'Thanks for your report. An admin reviewed it and took action on the listing.');
         res.json({ success: true, message: 'Listing hidden' });
     });
 });
@@ -335,6 +363,7 @@ exports.unhideListing = withLabel('listing', (req, res) => {
         if (err) return res.status(500).json({ error: err.message });
         if (result.affectedRows === 0) return res.status(404).json({ message: 'Listing not found' });
         listingsCache.clear();
+        notifyListingOwner(id, 'listing_unhidden', 'Your listing is visible again', (t) => `"${t}" is public again.`);
         res.json({ success: true, message: 'Listing is visible again' });
     });
 });
@@ -355,7 +384,43 @@ exports.dismissAppeal = withLabel('listing', (req, res) => {
         if (err) return res.status(500).json({ error: err.message });
         if (result.affectedRows === 0) return res.status(404).json({ message: 'No pending appeal for this listing.' });
         listingsCache.clear();
+        notifyListingOwner(id, 'appeal_declined', 'Your appeal was declined', (t) => `"${t}" stays hidden. Reason: ${reason}`);
         res.json({ success: true, message: 'Appeal declined' });
+    });
+});
+
+// ============================================================================
+//  REPORTS (users reporting listings)
+// ============================================================================
+// GET /api/admin/reports  ->  every OPEN report, newest first. The panel groups
+// them per listing.
+exports.getReportsAdmin = (req, res) => {
+    const sql = `
+        SELECT r.id, r.listing_id, r.reason, r.details, r.created_at,
+               u.full_name AS reporter_name, u.email AS reporter_email,
+               l.title, l.is_hidden, ll.full_name AS landlord_name
+        FROM listing_reports r
+        JOIN listings l ON r.listing_id = l.id
+        JOIN users u ON r.reporter_id = u.id
+        JOIN users ll ON l.user_id = ll.id
+        WHERE r.status = 'open'
+        ORDER BY r.created_at DESC
+        LIMIT 500
+    `;
+    db.query(sql, (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+};
+
+// POST /api/admin/listings/:id/dismiss-reports
+// Nothing is wrong with the listing: the reports are closed and reporters are told.
+exports.dismissReports = withLabel('listing', (req, res) => {
+    const { id } = req.params;
+    closeReports(id, 'dismissed', 'Thanks for your report. An admin reviewed it and found no violation.', (err, count) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (count === 0) return res.status(404).json({ message: 'No open reports for this listing.' });
+        res.json({ success: true, message: 'Reports dismissed' });
     });
 });
 
@@ -507,6 +572,7 @@ const AUDIT_ACTIONS = {
     listing_hide:    "(a.method = 'POST'   AND a.path LIKE '%/listings/%/hide')",
     listing_unhide:  "(a.method = 'POST'   AND a.path LIKE '%/listings/%/unhide')",
     appeal_dismiss:  "(a.method = 'POST'   AND a.path LIKE '%/listings/%/dismiss-appeal')",
+    reports_dismiss: "(a.method = 'POST'   AND a.path LIKE '%/listings/%/dismiss-reports')",
     listing_edit:    "(a.method = 'PUT'    AND a.path LIKE '%/listings/%')",
     listing_delete:  "(a.method = 'DELETE' AND a.path LIKE '%/listings/%')",
     review_delete:   "(a.method = 'DELETE' AND a.path LIKE '%/reviews/%')",
