@@ -4,7 +4,7 @@
 // Needs `app.set('trust proxy', 1)` in server.js: Render puts a proxy in front
 // of the app, and without it every visitor would look like the same IP.
 //
-// Install:  npm install express-rate-limit try
+// Install:  npm install express-rate-limit
 
 const { rateLimit } = require('express-rate-limit');
 
@@ -30,7 +30,7 @@ exports.signupLimiter = rateLimit({
     message: tooMany('Too many sign-up attempts. Please try again later.')
 });
 
-// NEW: sending chat messages: 20 per minute.
+// Sending chat messages: 20 per minute.
 exports.messageLimiter = rateLimit({
     windowMs: 60 * 1000,
     limit: 20,
@@ -39,7 +39,7 @@ exports.messageLimiter = rateLimit({
     message: tooMany('You are sending messages too fast. Please slow down.')
 });
 
-// NEW: posting reviews, comments and replies: 15 per 10 minutes.
+// Posting reviews, comments and replies: 15 per 10 minutes.
 exports.reviewLimiter = rateLimit({
     windowMs: 10 * 60 * 1000,
     limit: 15,
@@ -48,11 +48,20 @@ exports.reviewLimiter = rateLimit({
     message: tooMany('Too many reviews or comments in a short time. Please try again later.')
 });
 
-// NEW: appeals for hidden listings: 5 per hour.
+// Appeals for hidden listings: 5 per hour.
 exports.appealLimiter = rateLimit({
     windowMs: 60 * 60 * 1000,
     limit: 5,
     standardHeaders: 'draft-7',
     legacyHeaders: false,
     message: tooMany('Too many appeals. Please try again later.')
+});
+
+// NEW: reporting listings: 5 per hour.
+exports.reportLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    limit: 5,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: tooMany('Too many reports. Please try again later.')
 });
