@@ -6,7 +6,144 @@ const { runSmartSearch } = require('../utils/smartSearchLogic');
 // In-memory cache for GET /api/view - see utils/listingsCache.js.
 const listingsCache = require('../utils/listingsCache');
 
+// ============================================================================
+//  NOTIFICATIONS + REPORTS (NEW)
+// ============================================================================
+// Both tables are created automatically when the server starts.
+db.query(`
+    CREATE TABLE IF NOT EXISTS notifications (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        type VARCHAR(40) NOT NULL,
+        title VARCHAR(150) NOT NULL,
+        message VARCHAR(500) NOT NULL,
+        listing_id INT NULL,
+        is_read TINYINT(1) NOT NULL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_notif_user (user_id, is_read, id)
+    )
+`, (err) => { if (err) console.error('Could not create notifications table:', err.message); });
+
+db.query(`
+    CREATE TABLE IF NOT EXISTS listing_reports (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        listing_id INT NOT NULL,
+        reporter_id INT NOT NULL,
+        reason VARCHAR(30) NOT NULL,
+        details VARCHAR(500) NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'open',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        resolved_at DATETIME NULL,
+        UNIQUE KEY uniq_report (listing_id, reporter_id),
+        INDEX idx_report_status (status, listing_id)
+    )
+`, (err) => { if (err) console.error('Could not create listing_reports table:', err.message); });
+
+// Notifications older than 60 days are removed (at startup, then once a day).
+const cleanOldNotifications = () =>
+    db.query('DELETE FROM notifications WHERE created_at < (NOW() - INTERVAL 60 DAY)', () => {});
+setTimeout(cleanOldNotifications, 20000);
+setInterval(cleanOldNotifications, 24 * 60 * 60 * 1000).unref();
+
+// Saves one notification for one user. Never blocks or fails the request.
+function notifyUser(userId, type, title, message, listingId) {
+    if (!userId) return;
+    db.query(
+        'INSERT INTO notifications (user_id, type, title, message, listing_id) VALUES (?, ?, ?, ?, ?)',
+        [userId, String(type).slice(0, 40), String(title).slice(0, 150), String(message).slice(0, 500), listingId || null],
+        (err) => { if (err) console.error('Notification insert failed:', err.message); }
+    );
+}
+
+// Same, but the receiver is the owner of a listing. buildMessage(listingTitle) -> text.
+function notifyListingOwner(listingId, type, title, buildMessage) {
+    db.query('SELECT user_id, title FROM listings WHERE id = ?', [listingId], (err, rows) => {
+        if (err || !rows[0]) return;
+        notifyUser(rows[0].user_id, type, title, buildMessage(rows[0].title || 'your listing'), listingId);
+    });
+}
+exports.notifyUser = notifyUser;
+exports.notifyListingOwner = notifyListingOwner;
+
+// GET /api/notifications  ->  { notifications: [latest 30], unread: n }
+exports.getNotifications = (req, res) => {
+    const userId = req.userId;
+    db.query(
+        'SELECT id, type, title, message, listing_id, is_read, created_at FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 30',
+        [userId],
+        (err, rows) => {
+            if (err) return res.status(500).json({ success: false, message: 'Could not load notifications.' });
+            db.query('SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND is_read = 0', [userId], (cErr, cRows) => {
+                res.json({ notifications: rows, unread: cErr ? 0 : cRows[0].n });
+            });
+        }
+    );
+};
+
+exports.markNotificationRead = (req, res) => {
+    db.query('UPDATE notifications SET is_read = 1 WHERE id = ? AND user_id = ?', [req.params.id, req.userId], (err) => {
+        if (err) return res.status(500).json({ success: false });
+        res.json({ success: true });
+    });
+};
+
+exports.markAllNotificationsRead = (req, res) => {
+    db.query('UPDATE notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0', [req.userId], (err) => {
+        if (err) return res.status(500).json({ success: false });
+        res.json({ success: true });
+    });
+};
+
+exports.clearNotifications = (req, res) => {
+    db.query('DELETE FROM notifications WHERE user_id = ?', [req.userId], (err) => {
+        if (err) return res.status(500).json({ success: false });
+        res.json({ success: true });
+    });
+};
+
+// POST /api/listings/:id/report   { reason, details }
+// One report per user per listing. Reports NEVER hide anything by themselves:
+// an admin reviews them in the Reports panel.
+const REPORT_REASONS = ['fake', 'wrong_info', 'scam', 'inappropriate', 'unavailable', 'other'];
+
+exports.reportListing = (req, res) => {
+    const listingId = req.params.id;
+    const reason = String(req.body.reason || '');
+    const details = String(req.body.details || '').replace(/[<>]/g, '').trim().slice(0, 500);
+
+    if (!REPORT_REASONS.includes(reason)) {
+        return res.status(400).json({ success: false, message: 'Please choose a reason.' });
+    }
+    if (reason === 'other' && details.length < 5) {
+        return res.status(400).json({ success: false, message: 'Please describe the problem (at least 5 characters).' });
+    }
+
+    db.query('SELECT user_id, is_hidden FROM listings WHERE id = ?', [listingId], (err, rows) => {
+        if (err) return res.status(500).json({ success: false, message: 'Server error. Please try again.' });
+        if (rows.length === 0 || Number(rows[0].is_hidden) === 1) {
+            return res.status(404).json({ success: false, message: 'This listing is not available.' });
+        }
+        if (Number(rows[0].user_id) === Number(req.userId)) {
+            return res.status(400).json({ success: false, message: "You can't report your own listing." });
+        }
+
+        db.query(
+            'INSERT INTO listing_reports (listing_id, reporter_id, reason, details) VALUES (?, ?, ?, ?)',
+            [listingId, req.userId, reason, details || null],
+            (insErr) => {
+                if (insErr && insErr.code === 'ER_DUP_ENTRY') {
+                    return res.status(409).json({ success: false, message: 'You already reported this listing. Thank you!' });
+                }
+                if (insErr) return res.status(500).json({ success: false, message: 'Could not send the report. Please try again.' });
+                res.json({ success: true, message: 'Report sent. An admin will review it.' });
+            }
+        );
+    });
+};
+
+// ============================================================================
 // 1. CREATE NEW USER (Used for Sign Up)
+// ============================================================================
 // - the password is stored as a bcrypt hash, never plain text
 // - role is ALWAYS 'pending' here (the browser can't pick 'landlord')
 // - duplicate emails are rejected
@@ -323,6 +460,8 @@ exports.addListing = (req, res) => {
 //   - a tenant's star rating counts ONCE per listing (extra ratings are ignored,
 //     a comment sent with one is still saved)
 //   - the landlord never rates their own listing
+//   - NEW: an empty review (no rating and no text) is refused
+//   - NEW: the landlord is notified of a new review, and a tenant of a reply
 exports.addReview = (req, res) => {
     const { listing_id, comment, rating, is_reply, parent_review_id } = req.body;
     const user_id = req.userId;
@@ -331,14 +470,14 @@ exports.addReview = (req, res) => {
 
     const text = String(comment || '').trim().slice(0, 1000);
 
-    const lookupSql = `SELECT u.full_name, l.user_id AS owner_id
+    const lookupSql = `SELECT u.full_name, l.user_id AS owner_id, l.title
                        FROM users u JOIN listings l ON l.id = ?
                        WHERE u.id = ?`;
     db.query(lookupSql, [listing_id, user_id], (lookupErr, rows) => {
         if (lookupErr) return res.status(500).json({ success: false, message: 'Server error. Please try again.' });
         if (rows.length === 0) return res.status(404).json({ success: false, message: 'Listing not found.' });
 
-        const { full_name, owner_id } = rows[0];
+        const { full_name, owner_id, title } = rows[0];
         const isOwner = Number(owner_id) === Number(user_id);
         const wantsReply = !!is_reply;
 
@@ -346,11 +485,12 @@ exports.addReview = (req, res) => {
             return res.status(403).json({ success: false, message: 'Only the landlord of this listing can reply.' });
         }
 
-        const save = (finalRating, finalParentId, note) => {
+        const save = (finalRating, finalParentId, note, target) => {
             const sql = `INSERT INTO reviews (listing_id, user_id, user_name, comment, rating, is_reply, parent_review_id) VALUES (?, ?, ?, ?, ?, ?, ?)`;
             db.query(sql, [listing_id, user_id, full_name || 'User', text, finalRating, wantsReply ? 1 : 0, finalParentId], (err) => {
                 if (err) return res.status(500).json({ error: err.message });
                 listingsCache.clear(); // changes the listing's avg_rating/review_count
+                if (target) notifyUser(target.userId, target.type, target.title, target.message, listing_id);
                 res.json({ success: true, message: (wantsReply ? 'Reply submitted!' : 'Review submitted!') + (note || '') });
             });
         };
@@ -358,7 +498,7 @@ exports.addReview = (req, res) => {
         if (wantsReply) {
             if (!text) return res.status(400).json({ success: false, message: 'Please write a reply before posting.' });
 
-            db.query('SELECT id, listing_id, is_reply FROM reviews WHERE id = ?', [parent_review_id], (pErr, pRows) => {
+            db.query('SELECT id, listing_id, is_reply, user_id FROM reviews WHERE id = ?', [parent_review_id], (pErr, pRows) => {
                 if (pErr) return res.status(500).json({ success: false, message: 'Server error. Please try again.' });
                 const parent = pRows[0];
                 if (!parent || String(parent.listing_id) !== String(listing_id) || Number(parent.is_reply) === 1) {
@@ -369,22 +509,39 @@ exports.addReview = (req, res) => {
                     if (dRows.length > 0) {
                         return res.status(409).json({ success: false, message: 'You already replied to this review.' });
                     }
-                    save(0, parent.id);
+                    const target = Number(parent.user_id) === Number(user_id) ? null : {
+                        userId: parent.user_id,
+                        type: 'review_reply',
+                        title: 'The landlord replied to your review',
+                        message: `There is a new reply on "${title}".`
+                    };
+                    save(0, parent.id, '', target);
                 });
             });
             return;
         }
 
         const cleanRating = Math.min(5, Math.max(0, parseInt(rating) || 0));
-        if (isOwner || cleanRating === 0) return save(0, null);
+        if (!text && cleanRating === 0) {
+            return res.status(400).json({ success: false, message: 'Please add a rating or a comment.' });
+        }
+
+        const target = isOwner ? null : {
+            userId: owner_id,
+            type: 'new_review',
+            title: 'New review on your listing',
+            message: `${full_name || 'A user'} reviewed "${title}".`
+        };
+
+        if (isOwner || cleanRating === 0) return save(0, null, '', target);
 
         db.query('SELECT id FROM reviews WHERE listing_id = ? AND user_id = ? AND rating > 0 LIMIT 1', [listing_id, user_id], (rErr, rRows) => {
             if (rErr) return res.status(500).json({ success: false, message: 'Server error. Please try again.' });
-            if (rRows.length === 0) return save(cleanRating, null);
+            if (rRows.length === 0) return save(cleanRating, null, '', target);
             if (!text) {
                 return res.status(409).json({ success: false, message: 'You already rated this listing. You can still leave a comment.' });
             }
-            save(0, null, ' Your new rating was not counted because you already rated this listing.');
+            save(0, null, ' Your new rating was not counted because you already rated this listing.', target);
         });
     });
 };
@@ -592,7 +749,7 @@ exports.smartSearch = (req, res) => {
 // 12a. START (OR RESUME) A CONVERSATION
 // The tenant is the logged-in user (token) and the landlord is looked up from
 // the listing itself, so ids sent in the body are ignored.
-// NEW: no conversation can start about a hidden listing or with a suspended landlord.
+// No conversation can start about a hidden listing or with a suspended landlord.
 exports.startConversation = (req, res) => {
     const { listing_id } = req.body;
     const tenant_id = req.userId;
@@ -712,7 +869,7 @@ exports.getMessages = (req, res) => {
 };
 
 // 12d. SEND A MESSAGE - the sender is the logged-in user, and must be part of the conversation.
-// NEW: sending is refused while the listing is hidden or either person is suspended
+// Sending is refused while the listing is hidden or either person is suspended
 // (reading the old messages still works).
 exports.sendMessage = (req, res) => {
     const { conversation_id, message } = req.body;
@@ -750,8 +907,8 @@ exports.sendMessage = (req, res) => {
 // 13. DELETE LISTING (landlord deletes their OWN listing)
 // ============================================================================
 // Deletes a listing AND everything that points at it (reviews, bookmarks, chat
-// conversations + their messages), all-or-nothing in ONE transaction, and only
-// if this landlord owns it. (Admins can't delete listings.)
+// conversations + their messages, reports and notifications), all-or-nothing in
+// ONE transaction, and only if this landlord owns it. (Admins can't delete listings.)
 function deleteListingWithDependents(listingId, ownerId, done) {
     db.getConnection((connErr, conn) => {
         if (connErr) return done(connErr);
@@ -775,6 +932,8 @@ function deleteListingWithDependents(listingId, ownerId, done) {
                     ['DELETE FROM reviews WHERE listing_id = ? AND parent_review_id IS NOT NULL', [listingId]],
                     ['DELETE FROM reviews WHERE listing_id = ?', [listingId]],
                     ['DELETE FROM bookmarks WHERE listing_id = ?', [listingId]],
+                    ['DELETE FROM listing_reports WHERE listing_id = ?', [listingId]],
+                    ['DELETE FROM notifications WHERE listing_id = ?', [listingId]],
                     ['DELETE FROM listings WHERE id = ?', [listingId]]
                 ];
 
@@ -799,7 +958,7 @@ function deleteListingWithDependents(listingId, ownerId, done) {
 
 exports.deleteListing = (req, res) => {
     const listingId = req.params.id;
-    const user_id = req.userId; // from the login token try
+    const user_id = req.userId; // from the login token
 
     deleteListingWithDependents(listingId, user_id, (err, affectedRows) => {
         if (err) {
