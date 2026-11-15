@@ -1,7 +1,7 @@
 const db = require('../config/db');
 const bcrypt = require('bcryptjs');
 const { signUserToken } = require('../middleware/auth');
-// Shared Taglish-aware Smart Search logic (see utils/smartSearchLogic.js).
+// Shared Taglish-aware Smart Search logic (see utils/smartSearchLogic.js)..
 const { runSmartSearch } = require('../utils/smartSearchLogic');
 // In-memory cache for GET /api/view - see utils/listingsCache.js.
 const listingsCache = require('../utils/listingsCache');
