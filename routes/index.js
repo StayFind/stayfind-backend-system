@@ -3,8 +3,8 @@ const router = express.Router();
 const userController = require('../controllers/userController');
 const searchController = require('../controllers/searchController');
 const authController = require('../controllers/authController');
-// brute-force / spam limits (see middleware/rateLimit.js) try
-const { loginLimiter, signupLimiter, messageLimiter, reviewLimiter, appealLimiter } = require('../middleware/rateLimit');
+// brute-force / spam limits (see middleware/rateLimit.js)
+const { loginLimiter, signupLimiter, messageLimiter, reviewLimiter, appealLimiter, reportLimiter } = require('../middleware/rateLimit');
 // login-token check (JWT) - see middleware/auth.js
 // optionalUser = lets guests through but still recognises logged-in users
 const { requireUser, optionalUser } = require('../middleware/auth');
@@ -58,16 +58,24 @@ router.get('/view/:id', userController.getUserById); // your own profile only
 router.post('/add-listing', userController.addListing);
 router.delete('/delete-listing/:id', userController.deleteListing);
 router.post('/update-listing', userController.updateListing);
-// NEW: a landlord asks an admin to review their hidden listing
+// a landlord asks an admin to review their hidden listing
 router.post('/listings/:id/appeal', appealLimiter, userController.appealHiddenListing);
+// NEW: a user reports a listing to the admins
+router.post('/listings/:id/report', reportLimiter, userController.reportListing);
 
 // --- PROFILE ---
 router.post('/update-profile', userController.updateProfile);
 
 // --- REVIEWS & RATINGS ---
 router.post('/add-review', reviewLimiter, userController.addReview);
-// NEW: a landlord removes a comment on their own listing
+// a landlord removes a comment on their own listing
 router.delete('/delete-review/:id', userController.deleteReview);
+
+// --- NOTIFICATIONS (NEW) ---
+router.get('/notifications', userController.getNotifications);
+router.post('/notifications/read-all', userController.markAllNotificationsRead);
+router.post('/notifications/:id/read', userController.markNotificationRead);
+router.delete('/notifications', userController.clearNotifications);
 
 // --- BOOKMARKS ---
 router.post('/toggle-bookmark', userController.toggleBookmark);
