@@ -6,7 +6,7 @@ const authController = require('../controllers/authController');
 // brute-force / spam limits (see middleware/rateLimit.js)
 const { loginLimiter, signupLimiter, messageLimiter, reviewLimiter, appealLimiter, reportLimiter } = require('../middleware/rateLimit');
 // login-token check (JWT) - see middleware/auth.js
-// optionalUser = lets guests through but still recognises logged-in users
+// optionalUser = lets guests through but still recognises logged-in users dayum
 const { requireUser, optionalUser } = require('../middleware/auth');
 // cleans text fields and validates photo/document data (see middleware/sanitize.js)
 const { sanitizeBody } = require('../middleware/sanitize');
