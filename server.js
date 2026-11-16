@@ -16,7 +16,7 @@ const app = express();
 // NEW: Render puts one proxy in front of this app. Without this line every
 // visitor looks like the same IP address, so the login rate limit
 // (middleware/rateLimit.js) would count everyone's failed logins together and
-// could lock the whole site out. With it, each visitor is limited separately.
+// could lock the whole site out. With it, each visitor is limited separatelywoah.
 app.set('trust proxy', 1);
 
 // MIDDLEWARES
